@@ -4,10 +4,15 @@ const axios = require('axios');
 const tf = require('@tensorflow/tfjs-node');
 const cors = require('cors');
 const path = require('path');
+const canvas = require('canvas');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Configure face-api to use canvas
+const { Canvas, Image, ImageData } = canvas;
+faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
 // Load models
 async function loadModels() {
@@ -20,7 +25,6 @@ async function loadModels() {
     console.log('Models loaded successfully');
   } catch (error) {
     console.error('Error loading models:', error);
-    // Try loading from URL as fallback
     const MODEL_URL = 'https://raw.githubusercontent.com/vladmandic/face-api/master/model';
     await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
     await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
@@ -43,12 +47,12 @@ app.post('/detect', async (req, res) => {
     const response = await axios.get(image_url, { responseType: 'arraybuffer' });
     const buffer = Buffer.from(response.data);
     
-    // Decode image
-    const tensor = tf.node.decodeImage(buffer);
+    // Load image using canvas
+    const img = await canvas.loadImage(buffer);
     
     // Detect faces
     const detections = await faceapi
-      .detectAllFaces(tensor)
+      .detectAllFaces(img)
       .withFaceLandmarks()
       .withFaceDescriptors();
     
@@ -64,8 +68,6 @@ app.post('/detect', async (req, res) => {
         h: Math.round(d.detection.box.height)
       }
     }));
-    
-    tensor.dispose();
     
     res.json({ faces });
   } catch (error) {
