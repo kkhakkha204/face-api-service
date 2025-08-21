@@ -40,7 +40,7 @@ app.get('/', (req, res) => {
 
 app.post('/detect', async (req, res) => {
   try {
-    const { image_url } = req.body;
+    const { image_url, return_all_faces = false } = req.body;
     console.log('Processing image:', image_url);
     
     // Download image
@@ -50,28 +50,51 @@ app.post('/detect', async (req, res) => {
     // Load image using canvas
     const img = await canvas.loadImage(buffer);
     
-    // Detect faces
+    // Detect faces với nhiều options
     const detections = await faceapi
-      .detectAllFaces(img)
+      .detectAllFaces(img, new faceapi.SsdMobilenetv1Options({ 
+        minConfidence: 0.5,
+        maxResults: return_all_faces ? 100 : 1
+      }))
       .withFaceLandmarks()
       .withFaceDescriptors();
     
     console.log('Detections found:', detections.length);
     
     // Format response
-    const faces = detections.map(d => ({
+    const faces = detections.map((d, index) => ({
       embedding: Array.from(d.descriptor),
       area: {
         x: Math.round(d.detection.box.x),
         y: Math.round(d.detection.box.y),
         w: Math.round(d.detection.box.width),
         h: Math.round(d.detection.box.height)
-      }
+      },
+      confidence: d.detection.score,
+      index: index
     }));
     
     res.json({ faces });
   } catch (error) {
     console.error('Error detecting faces:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// New endpoint for comparing faces
+app.post('/compare', async (req, res) => {
+  try {
+    const { embedding1, embedding2 } = req.body;
+    
+    const distance = faceapi.euclideanDistance(embedding1, embedding2);
+    const similarity = Math.max(0, 1 - distance);
+    
+    res.json({ 
+      distance,
+      similarity,
+      is_match: distance < 0.4
+    });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
