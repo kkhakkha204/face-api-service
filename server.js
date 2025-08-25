@@ -5,16 +5,20 @@ const tf = require('@tensorflow/tfjs-node');
 const cors = require('cors');
 const path = require('path');
 const { createCanvas, loadImage } = require('canvas');
+const sharp = require('sharp'); // Thêm sharp để resize ảnh
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Configure face-api to use canvas
 const { Canvas, Image, ImageData } = require('canvas');
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
-// Load models once at startup
+// Configuration
+const MAX_IMAGE_SIZE = 1920; // Resize ảnh xuống max 1920px
+const BATCH_SIZE = 1; // Xử lý từng ảnh một
+const MEMORY_THRESHOLD = 50; // Giảm threshold để cleanup sớm hơn
+
 async function loadModels() {
   const modelPath = path.join(__dirname, 'models');
   
@@ -33,26 +37,62 @@ async function loadModels() {
   }
 }
 
-// Helper function to clean up resources
+// Aggressive memory cleanup
 function cleanupTensors() {
-  const numTensors = tf.memory().numTensors;
-  if (numTensors > 100) {
-    console.log(`Cleaning up ${numTensors} tensors`);
-    tf.disposeVariables();
-    if (global.gc) {
-      global.gc();
+  const memory = tf.memory();
+  console.log(`Memory cleanup - Tensors: ${memory.numTensors}, Bytes: ${(memory.numBytes / 1048576).toFixed(2)}MB`);
+  
+  // Dispose all variables
+  tf.disposeVariables();
+  
+  // Force garbage collection if available
+  if (global.gc) {
+    global.gc();
+  }
+  
+  // Clear TensorFlow backend
+  tf.engine().startScope();
+  tf.engine().endScope();
+  
+  const afterMemory = tf.memory();
+  console.log(`After cleanup - Tensors: ${afterMemory.numTensors}, Bytes: ${(afterMemory.numBytes / 1048576).toFixed(2)}MB`);
+}
+
+// Resize ảnh trước khi xử lý để giảm memory
+async function resizeImage(buffer, maxSize = MAX_IMAGE_SIZE) {
+  try {
+    const metadata = await sharp(buffer).metadata();
+    console.log(`Original image: ${metadata.width}x${metadata.height}`);
+    
+    if (metadata.width > maxSize || metadata.height > maxSize) {
+      const resized = await sharp(buffer)
+        .resize(maxSize, maxSize, {
+          fit: 'inside',
+          withoutEnlargement: true
+        })
+        .jpeg({ quality: 90 })
+        .toBuffer();
+      
+      const newMetadata = await sharp(resized).metadata();
+      console.log(`Resized to: ${newMetadata.width}x${newMetadata.height}`);
+      return resized;
     }
+    
+    return buffer;
+  } catch (error) {
+    console.error('Error resizing image:', error);
+    return buffer;
   }
 }
 
-// Health check
 app.get('/', (req, res) => {
   const memory = tf.memory();
   res.json({ 
-    status: 'Face API service is running',
+    status: 'Face API service is running (optimized)',
     memory: {
       numTensors: memory.numTensors,
-      numBytes: memory.numBytes
+      numBytes: memory.numBytes,
+      numBytesInMB: (memory.numBytes / 1048576).toFixed(2)
     }
   });
 });
@@ -60,75 +100,89 @@ app.get('/', (req, res) => {
 app.post('/detect', async (req, res) => {
   let tempCanvas = null;
   let img = null;
+  let detections = [];
   
   try {
     const { image_url, return_all_faces = false } = req.body;
     
     console.log(`\n=== Processing image: ${image_url} ===`);
-    console.log('Memory before:', tf.memory().numTensors, 'tensors');
     
-    // Download image with timeout and no-cache
+    // Check memory before processing
+    const memoryBefore = tf.memory();
+    if (memoryBefore.numTensors > MEMORY_THRESHOLD) {
+      console.log('Pre-emptive memory cleanup...');
+      cleanupTensors();
+    }
+    
+    // Download image with timeout
     const response = await axios.get(image_url, { 
       responseType: 'arraybuffer',
       timeout: 15000,
+      maxContentLength: 50 * 1024 * 1024, // Max 50MB
       headers: {
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Expires': '0'
-      },
-      // Add timestamp to URL to prevent caching
-      params: {
-        t: Date.now()
+        'Pragma': 'no-cache'
       }
     });
     
-    const buffer = Buffer.from(response.data);
-    console.log('Image downloaded, size:', buffer.length, 'bytes');
+    let buffer = Buffer.from(response.data);
+    console.log('Image downloaded, size:', (buffer.length / 1048576).toFixed(2), 'MB');
     
-    // Create fresh canvas for each request
+    // Resize image if too large
+    buffer = await resizeImage(buffer);
+    
+    // Load and process image
     tempCanvas = createCanvas(1, 1);
     const ctx = tempCanvas.getContext('2d');
     
-    // Load image
     img = await loadImage(buffer);
-    console.log('Image loaded, dimensions:', img.width, 'x', img.height);
+    console.log('Processing image:', img.width, 'x', img.height);
     
-    // Set canvas size and draw image
     tempCanvas.width = img.width;
     tempCanvas.height = img.height;
     ctx.drawImage(img, 0, 0);
     
-    // Detect faces with tf.tidy for automatic cleanup
-    let detections = await tf.tidy(() => {
-      return faceapi
+    // Detect faces with TensorFlow scope management
+    await tf.tidy(async () => {
+      // Try SsdMobilenetv1 first
+      detections = await faceapi
         .detectAllFaces(tempCanvas, new faceapi.SsdMobilenetv1Options({ 
-          minConfidence: 0.3,  // Lower threshold for better detection
-          maxResults: return_all_faces ? 100 : 10
+          minConfidence: 0.4,
+          maxResults: return_all_faces ? 50 : 10
         }))
         .withFaceLandmarks()
         .withFaceDescriptors();
-    });
-    
-    console.log('Initial detections found:', detections.length);
-    
-    // If no faces found, try with different settings
-    if (detections.length === 0) {
-      console.log('No faces found, trying with TinyFaceDetector...');
       
-      detections = await tf.tidy(() => {
-        return faceapi
+      console.log('SsdMobilenetv1 detections:', detections.length);
+      
+      // If no faces found, try TinyFaceDetector
+      if (detections.length === 0) {
+        console.log('Trying TinyFaceDetector...');
+        
+        // Load TinyFaceDetector if not loaded
+        if (!faceapi.nets.tinyFaceDetector.isLoaded) {
+          const modelPath = path.join(__dirname, 'models');
+          try {
+            await faceapi.nets.tinyFaceDetector.loadFromDisk(modelPath);
+          } catch {
+            const MODEL_URL = 'https://raw.githubusercontent.com/vladmandic/face-api/master/model';
+            await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+          }
+        }
+        
+        detections = await faceapi
           .detectAllFaces(tempCanvas, new faceapi.TinyFaceDetectorOptions({
             inputSize: 416,
-            scoreThreshold: 0.3
+            scoreThreshold: 0.4
           }))
           .withFaceLandmarks()
           .withFaceDescriptors();
-      });
-      
-      console.log('TinyFaceDetector found:', detections.length);
-    }
+        
+        console.log('TinyFaceDetector detections:', detections.length);
+      }
+    });
     
-    // Format response
+    // Convert detections to serializable format
     const faces = detections.map((d, index) => ({
       embedding: Array.from(d.descriptor),
       area: {
@@ -138,48 +192,51 @@ app.post('/detect', async (req, res) => {
         h: Math.round(d.detection.box.height)
       },
       confidence: d.detection.score,
-      index: index,
-      landmarks: d.landmarks ? d.landmarks.positions.length : 0
+      index: index
     }));
     
-    // Clear canvas
-    ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+    // Clean up canvas immediately
+    if (tempCanvas) {
+      ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+      tempCanvas.width = 1;
+      tempCanvas.height = 1;
+    }
     
-    // Cleanup tensors
+    // Force cleanup
     cleanupTensors();
     
-    console.log('Memory after:', tf.memory().numTensors, 'tensors');
     console.log(`=== Completed: ${faces.length} faces found ===\n`);
     
     res.json({ 
       faces,
       debug: {
         imageSize: `${img.width}x${img.height}`,
-        tensorsAfter: tf.memory().numTensors
+        facesFound: faces.length,
+        memoryUsed: (tf.memory().numBytes / 1048576).toFixed(2) + 'MB'
       }
     });
     
   } catch (error) {
-    console.error('Error detecting faces:', error);
+    console.error('Error detecting faces:', error.message);
     res.status(500).json({ 
       error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      type: error.name
     });
   } finally {
-    // Ensure cleanup happens
+    // Ensure cleanup
     if (tempCanvas) {
       const ctx = tempCanvas.getContext('2d');
       ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
       tempCanvas = null;
     }
     img = null;
+    detections = null;
     
-    // Force cleanup if too many tensors
+    // Final cleanup
     cleanupTensors();
   }
 });
 
-// Compare endpoint
 app.post('/compare', async (req, res) => {
   try {
     const { embedding1, embedding2 } = req.body;
@@ -202,20 +259,46 @@ app.post('/compare', async (req, res) => {
   }
 });
 
-// Cleanup endpoint for manual tensor cleanup
 app.post('/cleanup', (req, res) => {
   const before = tf.memory();
-  tf.disposeVariables();
-  if (global.gc) {
-    global.gc();
-  }
+  cleanupTensors();
   const after = tf.memory();
   
   res.json({
     message: 'Cleanup completed',
-    before: before.numTensors,
-    after: after.numTensors,
-    freed: before.numTensors - after.numTensors
+    before: {
+      tensors: before.numTensors,
+      bytes: before.numBytes,
+      mb: (before.numBytes / 1048576).toFixed(2)
+    },
+    after: {
+      tensors: after.numTensors,
+      bytes: after.numBytes,
+      mb: (after.numBytes / 1048576).toFixed(2)
+    },
+    freed: {
+      tensors: before.numTensors - after.numTensors,
+      mb: ((before.numBytes - after.numBytes) / 1048576).toFixed(2)
+    }
+  });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  const memory = tf.memory();
+  const memoryUsage = process.memoryUsage();
+  
+  res.json({
+    status: 'healthy',
+    tensorflow: {
+      tensors: memory.numTensors,
+      memoryMB: (memory.numBytes / 1048576).toFixed(2)
+    },
+    process: {
+      heapUsedMB: (memoryUsage.heapUsed / 1048576).toFixed(2),
+      heapTotalMB: (memoryUsage.heapTotal / 1048576).toFixed(2),
+      rssMB: (memoryUsage.rss / 1048576).toFixed(2)
+    }
   });
 });
 
@@ -224,14 +307,28 @@ const PORT = process.env.PORT || 5000;
 // Start server
 loadModels().then(() => {
   app.listen(PORT, () => {
-    console.log(`Face API service running on port ${PORT}`);
+    console.log(`Face API service (optimized) running on port ${PORT}`);
     console.log('Initial memory:', tf.memory());
     
-    // Periodic cleanup every 5 minutes
+    // Periodic cleanup every 2 minutes
     setInterval(() => {
-      console.log('Running periodic cleanup...');
-      cleanupTensors();
-    }, 5 * 60 * 1000);
+      const memory = tf.memory();
+      if (memory.numTensors > MEMORY_THRESHOLD) {
+        console.log('Periodic cleanup triggered...');
+        cleanupTensors();
+      }
+    }, 2 * 60 * 1000);
+    
+    // Monitor memory usage
+    setInterval(() => {
+      const memoryUsage = process.memoryUsage();
+      console.log(`Process Memory - Heap: ${(memoryUsage.heapUsed / 1048576).toFixed(2)}MB, RSS: ${(memoryUsage.rss / 1048576).toFixed(2)}MB`);
+      
+      // Restart if memory usage is too high (> 1GB)
+      if (memoryUsage.rss > 1024 * 1024 * 1024) {
+        console.error('Memory usage too high, consider restarting...');
+      }
+    }, 30 * 1000);
   });
 }).catch(error => {
   console.error('Failed to start:', error);
