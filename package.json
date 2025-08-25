@@ -4,8 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node --max-old-space-size=1536 server.js",
-    "dev": "nodemon --max-old-space-size=1536 server.js",
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -19,8 +18,5 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "sharp": "^0.34.3"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
   }
 }
