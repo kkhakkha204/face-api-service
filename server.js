@@ -5,7 +5,7 @@ const tf = require('@tensorflow/tfjs-node');
 const cors = require('cors');
 const path = require('path');
 const { createCanvas, loadImage } = require('canvas');
-const sharp = require('sharp'); // Thêm sharp để resize ảnh
+const sharp = require('sharp');
 
 const app = express();
 app.use(cors());
@@ -14,10 +14,9 @@ app.use(express.json({ limit: '50mb' }));
 const { Canvas, Image, ImageData } = require('canvas');
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
-// Configuration
-const MAX_IMAGE_SIZE = 1920; // Max width/height để resize
-const BATCH_SIZE = 3; // Số lượng face detection đồng thời
-const MEMORY_THRESHOLD = 50; // Cleanup khi vượt ngưỡng tensors
+const MAX_IMAGE_SIZE = 1920;
+const BATCH_SIZE = 3;
+const MEMORY_THRESHOLD = 50;
 
 async function loadModels() {
   const modelPath = path.join(__dirname, 'models');
@@ -26,6 +25,7 @@ async function loadModels() {
     await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
     await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
     await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
+    await faceapi.nets.tinyFaceDetector.loadFromDisk(modelPath);
     console.log('Models loaded successfully from disk');
   } catch (error) {
     console.error('Loading from disk failed, trying URL:', error.message);
@@ -33,6 +33,7 @@ async function loadModels() {
     await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
     await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
     await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
     console.log('Models loaded from URL');
   }
 }
@@ -48,7 +49,6 @@ function cleanupTensors(force = false) {
   }
 }
 
-// Resize ảnh để tránh out of memory
 async function resizeImage(buffer, maxSize = MAX_IMAGE_SIZE) {
   try {
     const metadata = await sharp(buffer).metadata();
@@ -75,7 +75,225 @@ async function resizeImage(buffer, maxSize = MAX_IMAGE_SIZE) {
   }
 }
 
-// Queue để xử lý tuần tự, tránh overload
+// Face alignment function
+function alignFace(canvas, landmarks) {
+  const ctx = canvas.getContext('2d');
+  
+  // Get eye positions from landmarks
+  const leftEye = landmarks.positions[36]; // Left eye center
+  const rightEye = landmarks.positions[45]; // Right eye center
+  
+  // Calculate rotation angle
+  const deltaX = rightEye.x - leftEye.x;
+  const deltaY = rightEye.y - leftEye.y;
+  const angle = Math.atan2(deltaY, deltaX);
+  
+  // Apply rotation if significant
+  if (Math.abs(angle) > 0.1) { // ~5.7 degrees
+    const centerX = (leftEye.x + rightEye.x) / 2;
+    const centerY = (leftEye.y + rightEye.y) / 2;
+    
+    ctx.translate(centerX, centerY);
+    ctx.rotate(-angle);
+    ctx.translate(-centerX, -centerY);
+    
+    return true;
+  }
+  
+  return false;
+}
+
+// Enhanced detection with multiple strategies
+async function detectWithMultipleStrategies(canvas, returnAllFaces) {
+  let allDetections = [];
+  
+  // Strategy 1: SSD MobileNet (best for front faces)
+  try {
+    const ssdDetections = await tf.tidy(() => {
+      return faceapi
+        .detectAllFaces(canvas, new faceapi.SsdMobilenetv1Options({ 
+          minConfidence: 0.15,
+          maxResults: returnAllFaces ? 50 : 15
+        }))
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+    });
+    
+    allDetections = allDetections.concat(ssdDetections.map(d => ({ ...d, method: 'ssd' })));
+    console.log(`SSD detections: ${ssdDetections.length}`);
+  } catch (e) {
+    console.log('SSD detection failed:', e.message);
+  }
+  
+  // Strategy 2: Tiny Face Detector (better for small/distant faces)
+  try {
+    cleanupTensors();
+    
+    const tinyDetections = await tf.tidy(() => {
+      return faceapi
+        .detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions({
+          inputSize: 608, // Higher resolution for group photos
+          scoreThreshold: 0.15
+        }))
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+    });
+    
+    allDetections = allDetections.concat(tinyDetections.map(d => ({ ...d, method: 'tiny' })));
+    console.log(`Tiny detections: ${tinyDetections.length}`);
+  } catch (e) {
+    console.log('Tiny detection failed:', e.message);
+  }
+  
+  // Strategy 3: Enhanced preprocessing for profile faces
+  try {
+    cleanupTensors();
+    
+    const ctx = canvas.getContext('2d');
+    const originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    
+    // Enhance contrast and brightness for profile faces
+    ctx.filter = 'contrast(1.3) brightness(1.2) saturate(1.1)';
+    ctx.drawImage(canvas, 0, 0);
+    
+    const enhancedDetections = await tf.tidy(() => {
+      return faceapi
+        .detectAllFaces(canvas, new faceapi.SsdMobilenetv1Options({ 
+          minConfidence: 0.12,
+          maxResults: 20
+        }))
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+    });
+    
+    // Restore original image
+    ctx.putImageData(originalImageData, 0, 0);
+    
+    allDetections = allDetections.concat(enhancedDetections.map(d => ({ ...d, method: 'enhanced' })));
+    console.log(`Enhanced detections: ${enhancedDetections.length}`);
+  } catch (e) {
+    console.log('Enhanced detection failed:', e.message);
+  }
+  
+  // Strategy 4: Multi-scale detection for group photos
+  if (canvas.width > 800 || canvas.height > 600) {
+    try {
+      cleanupTensors();
+      
+      // Create smaller version for distant faces
+      const smallCanvas = createCanvas(canvas.width * 0.7, canvas.height * 0.7);
+      const smallCtx = smallCanvas.getContext('2d');
+      smallCtx.drawImage(canvas, 0, 0, smallCanvas.width, smallCanvas.height);
+      
+      const multiScaleDetections = await tf.tidy(() => {
+        return faceapi
+          .detectAllFaces(smallCanvas, new faceapi.TinyFaceDetectorOptions({
+            inputSize: 512,
+            scoreThreshold: 0.2
+          }))
+          .withFaceLandmarks()
+          .withFaceDescriptors();
+      });
+      
+      // Scale coordinates back to original size
+      const scaleFactor = canvas.width / smallCanvas.width;
+      const scaledDetections = multiScaleDetections.map(d => {
+        const scaledBox = {
+          x: d.detection.box.x * scaleFactor,
+          y: d.detection.box.y * scaleFactor,
+          width: d.detection.box.width * scaleFactor,
+          height: d.detection.box.height * scaleFactor
+        };
+        
+        return {
+          ...d,
+          detection: { ...d.detection, box: scaledBox },
+          method: 'multiscale'
+        };
+      });
+      
+      allDetections = allDetections.concat(scaledDetections);
+      console.log(`Multi-scale detections: ${multiScaleDetections.length}`);
+    } catch (e) {
+      console.log('Multi-scale detection failed:', e.message);
+    }
+  }
+  
+  return allDetections;
+}
+
+// Deduplicate overlapping detections
+function deduplicateDetections(detections) {
+  const deduplicated = [];
+  const threshold = 0.3; // IoU threshold
+  
+  // Sort by confidence score
+  detections.sort((a, b) => b.detection.score - a.detection.score);
+  
+  for (const detection of detections) {
+    let isDuplicate = false;
+    
+    for (const existing of deduplicated) {
+      const iou = calculateIoU(detection.detection.box, existing.detection.box);
+      if (iou > threshold) {
+        isDuplicate = true;
+        break;
+      }
+    }
+    
+    if (!isDuplicate) {
+      deduplicated.push(detection);
+    }
+  }
+  
+  console.log(`Deduplicated: ${detections.length} -> ${deduplicated.length}`);
+  return deduplicated;
+}
+
+// Calculate Intersection over Union
+function calculateIoU(box1, box2) {
+  const x1 = Math.max(box1.x, box2.x);
+  const y1 = Math.max(box1.y, box2.y);
+  const x2 = Math.min(box1.x + box1.width, box2.x + box2.width);
+  const y2 = Math.min(box1.y + box1.height, box2.y + box2.height);
+  
+  if (x2 <= x1 || y2 <= y1) return 0;
+  
+  const intersection = (x2 - x1) * (y2 - y1);
+  const area1 = box1.width * box1.height;
+  const area2 = box2.width * box2.height;
+  const union = area1 + area2 - intersection;
+  
+  return intersection / union;
+}
+
+// Calculate face quality score
+function calculateQualityScore(detection, canvas) {
+  let score = detection.detection.score; // Base confidence
+  
+  // Size factor (larger faces = higher quality)
+  const faceArea = detection.detection.box.width * detection.detection.box.height;
+  const imageArea = canvas.width * canvas.height;
+  const sizeRatio = faceArea / imageArea;
+  const sizeFactor = Math.min(sizeRatio * 100, 1); // Cap at 1
+  
+  // Landmark quality (if landmarks are stable)
+  const landmarkFactor = detection.landmarks ? 0.1 : 0;
+  
+  // Position factor (center faces often higher quality)
+  const centerX = canvas.width / 2;
+  const centerY = canvas.height / 2;
+  const faceX = detection.detection.box.x + detection.detection.box.width / 2;
+  const faceY = detection.detection.box.y + detection.detection.box.height / 2;
+  const distanceFromCenter = Math.sqrt(
+    Math.pow(faceX - centerX, 2) + Math.pow(faceY - centerY, 2)
+  );
+  const maxDistance = Math.sqrt(Math.pow(centerX, 2) + Math.pow(centerY, 2));
+  const positionFactor = (1 - distanceFromCenter / maxDistance) * 0.1;
+  
+  return Math.min(score + sizeFactor * 0.2 + landmarkFactor + positionFactor, 1);
+}
+
 const detectionQueue = [];
 let isProcessing = false;
 
@@ -92,7 +310,6 @@ async function processQueue() {
     } catch (error) {
       task.reject(error);
     }
-    // Cleanup sau mỗi detection
     cleanupTensors();
   }
   
@@ -110,11 +327,11 @@ async function detectFacesInternal(imageUrl, returnAllFaces) {
     console.log(`\n=== Processing: ${imageUrl} ===`);
     console.log('Memory before:', tf.memory().numTensors, 'tensors');
     
-    // Download image với timeout
+    // Download image
     const response = await axios.get(imageUrl, { 
       responseType: 'arraybuffer',
-      timeout: 20000,
-      maxContentLength: 50 * 1024 * 1024, // Max 50MB
+      timeout: 30000, // Increased timeout for large images
+      maxContentLength: 50 * 1024 * 1024,
       headers: {
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache'
@@ -124,10 +341,8 @@ async function detectFacesInternal(imageUrl, returnAllFaces) {
     let buffer = Buffer.from(response.data);
     console.log('Downloaded:', buffer.length, 'bytes');
     
-    // Resize nếu ảnh quá lớn
     buffer = await resizeImage(buffer);
     
-    // Load và process image
     tempCanvas = createCanvas(1, 1);
     const ctx = tempCanvas.getContext('2d');
     
@@ -138,90 +353,48 @@ async function detectFacesInternal(imageUrl, returnAllFaces) {
     tempCanvas.height = img.height;
     ctx.drawImage(img, 0, 0);
     
-    // Detection với multiple strategies
-    let detections = [];
+    // Enhanced detection with multiple strategies
+    let allDetections = await detectWithMultipleStrategies(tempCanvas, returnAllFaces);
     
-    // Strategy 1: SSD MobileNet với confidence thấp hơn
-    detections = await tf.tidy(() => {
-      return faceapi
-        .detectAllFaces(tempCanvas, new faceapi.SsdMobilenetv1Options({ 
-          minConfidence: 0.2, // Giảm threshold
-          maxResults: returnAllFaces ? 50 : 10
-        }))
-        .withFaceLandmarks()
-        .withFaceDescriptors();
+    // Deduplicate overlapping faces
+    const uniqueDetections = deduplicateDetections(allDetections);
+    
+    // Convert to response format with enhanced quality scoring
+    const faces = uniqueDetections.map((d, index) => {
+      const qualityScore = calculateQualityScore(d, tempCanvas);
+      
+      return {
+        embedding: Array.from(d.descriptor),
+        area: {
+          x: Math.round(d.detection.box.x),
+          y: Math.round(d.detection.box.y),
+          w: Math.round(d.detection.box.width),
+          h: Math.round(d.detection.box.height)
+        },
+        confidence: d.detection.score,
+        quality: qualityScore,
+        method: d.method,
+        index: index,
+        // Add face angle estimation
+        landmarks_available: !!d.landmarks,
+        estimated_pose: d.landmarks ? estimateFacePose(d.landmarks) : null
+      };
     });
     
-    console.log('SSD detections:', detections.length);
+    // Sort by quality score (best first)
+    faces.sort((a, b) => b.quality - a.quality);
     
-    // Strategy 2: Nếu không tìm thấy, thử TinyFaceDetector
-    if (detections.length === 0) {
-      console.log('Trying TinyFaceDetector...');
-      
-      // Cleanup trước khi thử strategy khác
-      cleanupTensors(true);
-      
-      detections = await tf.tidy(() => {
-        return faceapi
-          .detectAllFaces(tempCanvas, new faceapi.TinyFaceDetectorOptions({
-            inputSize: 512,
-            scoreThreshold: 0.2
-          }))
-          .withFaceLandmarks()
-          .withFaceDescriptors();
-      });
-      
-      console.log('Tiny detections:', detections.length);
-    }
+    // Apply smart filtering
+    const filteredFaces = smartFilterFaces(faces, returnAllFaces);
     
-    // Strategy 3: Nếu vẫn không có, thử với ảnh enhanced
-    if (detections.length === 0) {
-      console.log('Trying with enhanced image...');
-      
-      // Enhance contrast/brightness
-      ctx.filter = 'contrast(1.2) brightness(1.1)';
-      ctx.drawImage(img, 0, 0);
-      
-      detections = await tf.tidy(() => {
-        return faceapi
-          .detectAllFaces(tempCanvas, new faceapi.SsdMobilenetv1Options({ 
-            minConfidence: 0.15,
-            maxResults: 20
-          }))
-          .withFaceLandmarks()
-          .withFaceDescriptors();
-      });
-      
-      console.log('Enhanced detections:', detections.length);
-    }
+    console.log(`=== Completed: ${filteredFaces.length}/${faces.length} faces (filtered by quality) ===\n`);
     
-    // Convert results
-    const faces = detections.map((d, index) => ({
-      embedding: Array.from(d.descriptor),
-      area: {
-        x: Math.round(d.detection.box.x),
-        y: Math.round(d.detection.box.y),
-        w: Math.round(d.detection.box.width),
-        h: Math.round(d.detection.box.height)
-      },
-      confidence: d.detection.score,
-      index: index
-    }));
-    
-    // Cleanup
-    ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
-    tempCanvas = null;
-    img = null;
-    
-    console.log(`=== Completed: ${faces.length} faces ===\n`);
-    
-    return { faces };
+    return { faces: filteredFaces };
     
   } catch (error) {
     console.error('Detection error:', error.message);
     throw error;
   } finally {
-    // Ensure cleanup
     if (tempCanvas) {
       const ctx = tempCanvas.getContext('2d');
       ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
@@ -230,21 +403,76 @@ async function detectFacesInternal(imageUrl, returnAllFaces) {
     img = null;
     buffer = null;
     
-    // Force cleanup after each detection
     cleanupTensors(true);
   }
 }
 
-// API Endpoints
+// Estimate face pose from landmarks
+function estimateFacePose(landmarks) {
+  if (!landmarks || !landmarks.positions) return null;
+  
+  try {
+    const nose = landmarks.positions[30]; // Nose tip
+    const leftEye = landmarks.positions[36]; // Left eye
+    const rightEye = landmarks.positions[45]; // Right eye
+    const mouth = landmarks.positions[48]; // Mouth corner
+    
+    // Calculate yaw (left-right rotation)
+    const eyeDistance = Math.abs(rightEye.x - leftEye.x);
+    const noseToEyeDistance = Math.abs(nose.x - (leftEye.x + rightEye.x) / 2);
+    const yaw = (noseToEyeDistance / eyeDistance) - 0.5; // Normalized
+    
+    // Calculate pitch (up-down rotation) 
+    const eyeY = (leftEye.y + rightEye.y) / 2;
+    const noseToEyeY = nose.y - eyeY;
+    const eyeToMouthY = mouth.y - eyeY;
+    const pitch = noseToEyeY / Math.abs(eyeToMouthY);
+    
+    return {
+      yaw: Math.max(-1, Math.min(1, yaw * 2)), // Clamp between -1 and 1
+      pitch: Math.max(-1, Math.min(1, pitch)),
+      frontal: Math.abs(yaw) < 0.3 && Math.abs(pitch) < 0.3
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Smart filtering based on quality and diversity
+function smartFilterFaces(faces, returnAll) {
+  if (returnAll) {
+    return faces.filter(f => f.quality > 0.15); // Very permissive
+  }
+  
+  // For single face queries, prefer frontal high-quality faces
+  const frontalFaces = faces.filter(f => 
+    f.estimated_pose?.frontal && f.quality > 0.4
+  );
+  
+  if (frontalFaces.length > 0) {
+    return frontalFaces.slice(0, 5); // Top 5 frontal faces
+  }
+  
+  // Fallback to best quality faces
+  return faces.filter(f => f.quality > 0.25).slice(0, 8);
+}
+
+// Routes
 app.get('/', (req, res) => {
   const memory = tf.memory();
   res.json({ 
-    status: 'Face API service running',
+    status: 'Enhanced Face API service running',
     memory: {
       numTensors: memory.numTensors,
       numBytes: Math.round(memory.numBytes / 1024 / 1024) + 'MB'
     },
     queueLength: detectionQueue.length,
+    features: {
+      face_alignment: true,
+      multi_angle_detection: true,
+      group_photo_optimization: true,
+      quality_scoring: true
+    },
     config: {
       maxImageSize: MAX_IMAGE_SIZE,
       batchSize: BATCH_SIZE
@@ -256,7 +484,6 @@ app.post('/detect', async (req, res) => {
   try {
     const { image_url, return_all_faces = false } = req.body;
     
-    // Add to queue
     const result = await new Promise((resolve, reject) => {
       detectionQueue.push({
         imageUrl: image_url,
@@ -273,7 +500,7 @@ app.post('/detect', async (req, res) => {
     console.error('API error:', error);
     res.status(500).json({ 
       error: error.message,
-      faces: [] // Return empty array để không break flow
+      faces: [] 
     });
   }
 });
@@ -300,20 +527,6 @@ app.post('/compare', async (req, res) => {
   }
 });
 
-app.post('/cleanup', (req, res) => {
-  const before = tf.memory();
-  cleanupTensors(true);
-  const after = tf.memory();
-  
-  res.json({
-    message: 'Cleanup completed',
-    before: before.numTensors,
-    after: after.numTensors,
-    freed: before.numTensors - after.numTensors
-  });
-});
-
-// Health check endpoint
 app.get('/health', async (req, res) => {
   const memory = tf.memory();
   const healthy = memory.numTensors < 500 && !isProcessing;
@@ -331,10 +544,10 @@ app.get('/health', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-// Start server
 loadModels().then(() => {
   app.listen(PORT, () => {
-    console.log(`Face API service running on port ${PORT}`);
+    console.log(`Enhanced Face API service running on port ${PORT}`);
+    console.log('Features: Face Alignment, Multi-angle Detection, Group Photo Optimization');
     console.log('Initial memory:', tf.memory());
     
     // Periodic cleanup
@@ -344,9 +557,9 @@ loadModels().then(() => {
         console.log('Periodic cleanup...');
         cleanupTensors(true);
       }
-    }, 60000); // Every minute
+    }, 60000);
     
-    // Force GC every 5 minutes
+    // Force garbage collection
     setInterval(() => {
       if (global.gc) {
         console.log('Force garbage collection...');
