@@ -15,7 +15,7 @@ const { Canvas, Image, ImageData } = require('canvas');
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
 const MAX_IMAGE_SIZE = 1920;
-const BATCH_SIZE = 1;
+const BATCH_SIZE = 3;
 const MEMORY_THRESHOLD = 50;
 
 async function loadModels() {
