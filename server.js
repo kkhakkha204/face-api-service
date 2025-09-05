@@ -14,9 +14,9 @@ app.use(express.json({ limit: '50mb' }));
 const { Canvas, Image, ImageData } = require('canvas');
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
-const MAX_IMAGE_SIZE = 1280;
+const MAX_IMAGE_SIZE = 1920;
 const BATCH_SIZE = 1;
-const MEMORY_THRESHOLD = 20;
+const MEMORY_THRESHOLD = 50;
 
 async function loadModels() {
   const modelPath = path.join(__dirname, 'models');
@@ -146,34 +146,34 @@ async function detectWithMultipleStrategies(canvas, returnAllFaces) {
   }
   
   // Strategy 3: Enhanced preprocessing for profile faces
-  // try {
-  //   cleanupTensors();
+  try {
+    cleanupTensors();
     
-  //   const ctx = canvas.getContext('2d');
-  //   const originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const ctx = canvas.getContext('2d');
+    const originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     
-  //   // Enhance contrast and brightness for profile faces
-  //   ctx.filter = 'contrast(1.3) brightness(1.2) saturate(1.1)';
-  //   ctx.drawImage(canvas, 0, 0);
+    // Enhance contrast and brightness for profile faces
+    ctx.filter = 'contrast(1.3) brightness(1.2) saturate(1.1)';
+    ctx.drawImage(canvas, 0, 0);
     
-  //   const enhancedDetections = await tf.tidy(() => {
-  //     return faceapi
-  //       .detectAllFaces(canvas, new faceapi.SsdMobilenetv1Options({ 
-  //         minConfidence: 0.12,
-  //         maxResults: 20
-  //       }))
-  //       .withFaceLandmarks()
-  //       .withFaceDescriptors();
-  //   });
+    const enhancedDetections = await tf.tidy(() => {
+      return faceapi
+        .detectAllFaces(canvas, new faceapi.SsdMobilenetv1Options({ 
+          minConfidence: 0.12,
+          maxResults: 20
+        }))
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+    });
     
-  //   // Restore original image
-  //   ctx.putImageData(originalImageData, 0, 0);
+    // Restore original image
+    ctx.putImageData(originalImageData, 0, 0);
     
-  //   allDetections = allDetections.concat(enhancedDetections.map(d => ({ ...d, method: 'enhanced' })));
-  //   console.log(`Enhanced detections: ${enhancedDetections.length}`);
-  // } catch (e) {
-  //   console.log('Enhanced detection failed:', e.message);
-  // }
+    allDetections = allDetections.concat(enhancedDetections.map(d => ({ ...d, method: 'enhanced' })));
+    console.log(`Enhanced detections: ${enhancedDetections.length}`);
+  } catch (e) {
+    console.log('Enhanced detection failed:', e.message);
+  }
   
   // Strategy 4: Multi-scale detection for group photos
   if (canvas.width > 800 || canvas.height > 600) {
@@ -557,7 +557,7 @@ loadModels().then(() => {
         console.log('Periodic cleanup...');
         cleanupTensors(true);
       }
-    }, 15000);
+    }, 60000);
     
     // Force garbage collection
     setInterval(() => {
