@@ -14,9 +14,9 @@ app.use(express.json({ limit: '50mb' }));
 const { Canvas, Image, ImageData } = require('canvas');
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
-const MAX_IMAGE_SIZE = 1920;
-const BATCH_SIZE = 3;
-const MEMORY_THRESHOLD = 50;
+const MAX_IMAGE_SIZE = 1280;
+const BATCH_SIZE = 5;
+const MEMORY_THRESHOLD = 30;
 
 async function loadModels() {
   const modelPath = path.join(__dirname, 'models');
