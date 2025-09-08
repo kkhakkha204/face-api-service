@@ -320,167 +320,91 @@ async function processQueue() {
 }
 
 async function detectFacesInternal(imageUrl, returnAllFaces) {
- let tempCanvas = null;
- let img = null;
- 
- try {
-   console.log(`\n=== Processing: ${imageUrl} ===`);
-   console.log('Memory before:', tf.memory().numTensors, 'tensors');
-   
-   // Download image
-   const response = await axios.get(imageUrl, { 
-     responseType: 'arraybuffer',
-     timeout: 30000,
-     maxContentLength: 50 * 1024 * 1024,
-     headers: {
-       'Cache-Control': 'no-cache',
-       'Pragma': 'no-cache'
-     }
-   });
-   
-   let buffer = Buffer.from(response.data);
-   console.log('Downloaded:', buffer.length, 'bytes');
-   
-   buffer = await resizeImage(buffer);
-   
-   tempCanvas = createCanvas(1, 1);
-   const ctx = tempCanvas.getContext('2d');
-   
-   img = await loadImage(buffer);
-   console.log('Processing:', img.width, 'x', img.height);
-   
-   tempCanvas.width = img.width;
-   tempCanvas.height = img.height;
-   ctx.drawImage(img, 0, 0);
-   
-   // Enhanced detection with multiple strategies
-   let allDetections = await detectWithMultipleStrategies(tempCanvas, returnAllFaces);
-   
-   // ADD SOLUTION 1: Preprocessing for small faces if no detections found
-   if (allDetections.length === 0) {
-     console.log('No faces found, trying enhanced preprocessing for small faces...');
-     allDetections = await preprocessForSmallFaces(tempCanvas, returnAllFaces);
-   }
-   
-   // Deduplicate overlapping faces
-   const uniqueDetections = deduplicateDetections(allDetections);
-   
-   // Convert to response format with enhanced quality scoring
-   const faces = uniqueDetections.map((d, index) => {
-     const qualityScore = calculateQualityScore(d, tempCanvas);
-     
-     return {
-       embedding: Array.from(d.descriptor),
-       area: {
-         x: Math.round(d.detection.box.x),
-         y: Math.round(d.detection.box.y),
-         w: Math.round(d.detection.box.width),
-         h: Math.round(d.detection.box.height)
-       },
-       confidence: d.detection.score,
-       quality: qualityScore,
-       method: d.method,
-       index: index,
-       landmarks_available: !!d.landmarks,
-       estimated_pose: d.landmarks ? estimateFacePose(d.landmarks) : null
-     };
-   });
-   
-   // Sort by quality score (best first)
-   faces.sort((a, b) => b.quality - a.quality);
-   
-   // Apply smart filtering
-   const filteredFaces = smartFilterFaces(faces, returnAllFaces);
-   
-   console.log(`=== Completed: ${filteredFaces.length}/${faces.length} faces (filtered by quality) ===\n`);
-   
-   return { faces: filteredFaces };
-   
- } catch (error) {
-   console.error('Detection error:', error.message);
-   throw error;
- } finally {
-   if (tempCanvas) {
-     const ctx = tempCanvas.getContext('2d');
-     ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
-   }
-   tempCanvas = null;
-   img = null;
-   buffer = null;
-   
-   cleanupTensors(true);
- }
-}
-
-// ADD this new function before detectFacesInternal
-async function preprocessForSmallFaces(canvas, returnAllFaces) {
- console.log('Preprocessing for small faces...');
- 
- // Define potential face regions for full body photos
- const regions = [
-   // Top 30% of image (where heads usually are)
-   { x: 0, y: 0, w: canvas.width, h: Math.floor(canvas.height * 0.3) },
-   // Center-top region
-   { x: Math.floor(canvas.width * 0.2), y: 0, w: Math.floor(canvas.width * 0.6), h: Math.floor(canvas.height * 0.4) },
-   // Upper third
-   { x: 0, y: 0, w: canvas.width, h: Math.floor(canvas.height * 0.33) }
- ];
- 
- let allDetections = [];
- 
- for (let i = 0; i < regions.length; i++) {
-   const region = regions[i];
-   
-   try {
-     // Create cropped canvas for this region
-     const croppedCanvas = createCanvas(region.w, region.h);
-     const croppedCtx = croppedCanvas.getContext('2d');
-     
-     // Copy region to new canvas
-     croppedCtx.drawImage(canvas, region.x, region.y, region.w, region.h, 0, 0, region.w, region.h);
-     
-     // Enhance contrast and brightness for better detection
-     croppedCtx.filter = 'contrast(1.5) brightness(1.3) saturate(1.2)';
-     croppedCtx.drawImage(croppedCanvas, 0, 0);
-     
-     // Try detection on enhanced region
-     const regionDetections = await tf.tidy(() => {
-       return faceapi
-         .detectAllFaces(croppedCanvas, new faceapi.SsdMobilenetv1Options({ 
-           minConfidence: 0.1, // Lower threshold for small faces
-           maxResults: 10
-         }))
-         .withFaceLandmarks()
-         .withFaceDescriptors();
-     });
-     
-     // Scale coordinates back to original canvas
-     const scaledDetections = regionDetections.map(d => {
-       const scaledBox = {
-         x: d.detection.box.x + region.x,
-         y: d.detection.box.y + region.y,
-         width: d.detection.box.width,
-         height: d.detection.box.height
-       };
-       
-       return {
-         ...d,
-         detection: { ...d.detection, box: scaledBox },
-         method: `enhanced_region_${i}`
-       };
-     });
-     
-     allDetections = allDetections.concat(scaledDetections);
-     console.log(`Region ${i} detections: ${regionDetections.length}`);
-     
-     cleanupTensors();
-     
-   } catch (e) {
-     console.log(`Region ${i} detection failed:`, e.message);
-   }
- }
- 
- return allDetections;
+  let tempCanvas = null;
+  let img = null;
+  
+  try {
+    console.log(`\n=== Processing: ${imageUrl} ===`);
+    console.log('Memory before:', tf.memory().numTensors, 'tensors');
+    
+    // Download image
+    const response = await axios.get(imageUrl, { 
+      responseType: 'arraybuffer',
+      timeout: 30000, // Increased timeout for large images
+      maxContentLength: 50 * 1024 * 1024,
+      headers: {
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+    });
+    
+    let buffer = Buffer.from(response.data);
+    console.log('Downloaded:', buffer.length, 'bytes');
+    
+    buffer = await resizeImage(buffer);
+    
+    tempCanvas = createCanvas(1, 1);
+    const ctx = tempCanvas.getContext('2d');
+    
+    img = await loadImage(buffer);
+    console.log('Processing:', img.width, 'x', img.height);
+    
+    tempCanvas.width = img.width;
+    tempCanvas.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    
+    // Enhanced detection with multiple strategies
+    let allDetections = await detectWithMultipleStrategies(tempCanvas, returnAllFaces);
+    
+    // Deduplicate overlapping faces
+    const uniqueDetections = deduplicateDetections(allDetections);
+    
+    // Convert to response format with enhanced quality scoring
+    const faces = uniqueDetections.map((d, index) => {
+      const qualityScore = calculateQualityScore(d, tempCanvas);
+      
+      return {
+        embedding: Array.from(d.descriptor),
+        area: {
+          x: Math.round(d.detection.box.x),
+          y: Math.round(d.detection.box.y),
+          w: Math.round(d.detection.box.width),
+          h: Math.round(d.detection.box.height)
+        },
+        confidence: d.detection.score,
+        quality: qualityScore,
+        method: d.method,
+        index: index,
+        // Add face angle estimation
+        landmarks_available: !!d.landmarks,
+        estimated_pose: d.landmarks ? estimateFacePose(d.landmarks) : null
+      };
+    });
+    
+    // Sort by quality score (best first)
+    faces.sort((a, b) => b.quality - a.quality);
+    
+    // Apply smart filtering
+    const filteredFaces = smartFilterFaces(faces, returnAllFaces);
+    
+    console.log(`=== Completed: ${filteredFaces.length}/${faces.length} faces (filtered by quality) ===\n`);
+    
+    return { faces: filteredFaces };
+    
+  } catch (error) {
+    console.error('Detection error:', error.message);
+    throw error;
+  } finally {
+    if (tempCanvas) {
+      const ctx = tempCanvas.getContext('2d');
+      ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+    }
+    tempCanvas = null;
+    img = null;
+    buffer = null;
+    
+    cleanupTensors(true);
+  }
 }
 
 // Estimate face pose from landmarks
